@@ -49,13 +49,30 @@ def lade_config(pfad: str = "config.ini") -> configparser.ConfigParser:
 # ── OAuth 1.0 Authentifizierung ──────────────────────────────────────────
 
 def erstelle_oauth(config: configparser.ConfigParser) -> OAuth1:
-    """Erstellt OAuth1-Authentifizierung für die IS24 API."""
+    """
+    Erstellt OAuth1-Authentifizierung für die IS24 API.
+
+    Zwei Modi:
+    - Two-Legged OAuth: Nur consumer_key + consumer_secret (für Such-API)
+    - Three-Legged OAuth: Zusätzlich access_token + access_token_secret (für User-Daten)
+    """
     api = config["immoscout24_api"]
+    access_token = api.get("access_token", "").strip()
+    access_token_secret = api.get("access_token_secret", "").strip()
+
+    # Two-Legged OAuth wenn keine Access Tokens vorhanden
+    if not access_token or access_token.startswith("DEIN_"):
+        return OAuth1(
+            client_key=api["consumer_key"],
+            client_secret=api["consumer_secret"],
+        )
+
+    # Three-Legged OAuth mit Access Tokens
     return OAuth1(
         client_key=api["consumer_key"],
         client_secret=api["consumer_secret"],
-        resource_owner_key=api["access_token"],
-        resource_owner_secret=api["access_token_secret"],
+        resource_owner_key=access_token,
+        resource_owner_secret=access_token_secret,
     )
 
 
@@ -65,8 +82,11 @@ def suche_immobilien(config: configparser.ConfigParser, oauth: OAuth1) -> list:
     """
     Sucht Immobilien über die IS24 REST API.
 
-    Endpunkt: /restapi/api/search/v2.0/search/region
-    Dokumentation: https://api.immobilienscout24.de/our-apis/search/
+    Endpunkt: /restapi/api/search/v1.0/search/region
+    Dokumentation: https://api.immobilienscout24.de/api-docs/search/
+
+    Query-Parameter verwenden Range-Format: "min-max" (z.B. "100000-500000")
+    Leere Seite = offenes Ende (z.B. "-500000" = bis 500k, "100000-" = ab 100k)
     """
     base_url = config.get("api_settings", "base_url",
                           fallback="https://rest.immobilienscout24.de")
@@ -87,17 +107,30 @@ def suche_immobilien(config: configparser.ConfigParser, oauth: OAuth1) -> list:
         (suchart, immobilientyp), "apartmentbuy"
     )
 
-    # Suchparameter zusammenbauen
+    # Preis-Range zusammenbauen (IS24-Format: "min-max")
+    preis_min = such.get("preis_min", "")
+    preis_max = such.get("preis_max", "")
+    price_range = f"{preis_min}-{preis_max}" if preis_min or preis_max else ""
+
+    # Zimmer-Range
+    zimmer_min = such.get("zimmer_min", "")
+    zimmer_max = such.get("zimmer_max", "")
+    rooms_range = f"{zimmer_min}-{zimmer_max}" if zimmer_min or zimmer_max else ""
+
+    # Flächen-Range
+    flaeche_min = such.get("flaeche_min", "")
+    flaeche_max = such.get("flaeche_max", "")
+    space_range = f"{flaeche_min}-{flaeche_max}" if flaeche_min or flaeche_max else ""
+
+    # Suchparameter zusammenbauen (IS24 v1.0 API Format)
     params = {
         "realestatetype": realestatetype,
         "geocodes": such.get("geocode", ""),
-        "price.min": such.get("preis_min", ""),
-        "price.max": such.get("preis_max", ""),
-        "numberofrooms.min": such.get("zimmer_min", ""),
-        "numberofrooms.max": such.get("zimmer_max", ""),
-        "livingspace.min": such.get("flaeche_min", ""),
-        "livingspace.max": such.get("flaeche_max", ""),
-        "pagesize": str(page_size),
+        "price": price_range,
+        "pricetype": "purchaseprice" if suchart == "buy" else "rentprice",
+        "numberofrooms": rooms_range,
+        "livingspace": space_range,
+        "pagesize": str(min(page_size, 200)),
         "pagenumber": "1",
     }
 
@@ -112,10 +145,9 @@ def suche_immobilien(config: configparser.ConfigParser, oauth: OAuth1) -> list:
     while len(alle_angebote) < max_ergebnisse:
         params["pagenumber"] = str(seite)
 
-        url = f"{base_url}/restapi/api/search/v2.0/search/region"
+        url = f"{base_url}/restapi/api/search/v1.0/search/region"
         headers = {
             "Accept": "application/json",
-            "Content-Type": "application/json",
         }
 
         print(f"  Lade Seite {seite}...")
@@ -156,7 +188,8 @@ def suche_immobilien(config: configparser.ConfigParser, oauth: OAuth1) -> list:
         alle_angebote.extend(ergebnisse)
 
         # Prüfen ob es weitere Seiten gibt
-        paging = daten.get("resultlistResultList", {}).get("paging", {})
+        result_list = daten.get("resultlist.resultlist", {})
+        paging = result_list.get("paging", {})
         total_pages = paging.get("numberOfPages", 1)
 
         if seite >= total_pages:
@@ -169,10 +202,10 @@ def suche_immobilien(config: configparser.ConfigParser, oauth: OAuth1) -> list:
 
 
 def _parse_suchergebnisse(daten: dict, realestatetype: str) -> list:
-    """Parst die JSON-Antwort der IS24 Such-API."""
+    """Parst die JSON-Antwort der IS24 Such-API (v1.0 Format)."""
     angebote = []
 
-    result_list = daten.get("resultlistResultList", {})
+    result_list = daten.get("resultlist.resultlist", {})
     entries = result_list.get("resultlistEntries", [])
 
     if not entries:
@@ -262,7 +295,7 @@ def hole_expose_details(expose_id: str, config: configparser.ConfigParser,
     base_url = config.get("api_settings", "base_url",
                           fallback="https://rest.immobilienscout24.de")
 
-    url = f"{base_url}/restapi/api/search/v2.0/expose/{expose_id}"
+    url = f"{base_url}/restapi/api/search/v1.0/expose/{expose_id}"
     headers = {"Accept": "application/json"}
 
     try:
